@@ -251,6 +251,9 @@ def extract(lines: list[dict]) -> tuple[dict, dict, list[dict]]:
 def expected_visible_in_ocr(field: str, expected, lines: list[dict]) -> bool:
     if expected is None:
         return True
+    if field == "documentType":
+        aliases = DOCUMENT_TYPES.get(str(expected), [])
+        return any(has_alias(line, aliases) for line in lines)
     if field in {"birthDate", "issueDate", "expiryDate"}:
         return any(parse_date(line["text"]) == expected for line in lines)
     if field == "documentNumber":
