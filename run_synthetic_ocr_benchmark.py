@@ -182,10 +182,11 @@ def extract_name(lines: list[dict], field: str) -> tuple[str | None, list[int]]:
     return None, []
 
 
-def extract(lines: list[dict]) -> tuple[dict, dict, list[dict]]:
+def extract(lines: list[dict]) -> tuple[dict, dict, list[dict], dict]:
     result = {"issueDate": None}
     evidence = {}
     review = []
+    candidate_diagnostics = {}
     all_text = " ".join(line["normalized"] for line in lines)
     result["documentType"] = next(
         (kind for kind, aliases in DOCUMENT_TYPES.items() if any(normalize(alias) in all_text for alias in aliases)),
@@ -199,6 +200,27 @@ def extract(lines: list[dict]) -> tuple[dict, dict, list[dict]]:
             value = parse_date(line["text"]) if field != "documentNumber" else identifier(line["text"])
             if value:
                 values.append((line, value))
+        candidate_diagnostics[field] = {
+            "labels": [
+                {
+                    "id": line["id"],
+                    "text": line["text"],
+                    "confidence": line["confidence"],
+                    "center": line["center"],
+                }
+                for line in labels
+            ],
+            "compatibleValues": [
+                {
+                    "id": line["id"],
+                    "value": value,
+                    "text": line["text"],
+                    "confidence": line["confidence"],
+                    "center": line["center"],
+                }
+                for line, value in values
+            ],
+        }
         ranked = []
         for label in labels:
             for value_line, value in values:
@@ -224,6 +246,18 @@ def extract(lines: list[dict]) -> tuple[dict, dict, list[dict]]:
         result[field] = value
         if source_ids:
             evidence[field] = source_ids
+        candidate_diagnostics[field] = {
+            "labels": [
+                {
+                    "id": line["id"],
+                    "text": line["text"],
+                    "confidence": line["confidence"],
+                    "center": line["center"],
+                }
+                for line in lines if has_alias(line, NAME_ALIASES[field])
+            ],
+            "selectedEvidence": source_ids,
+        }
     if result.get("expiryDate"):
         expiry = datetime.fromisoformat(result["expiryDate"]).date()
         if expiry < datetime.now().date():
@@ -245,7 +279,7 @@ def extract(lines: list[dict]) -> tuple[dict, dict, list[dict]]:
                     "value": right_value,
                     "reason": f"date chronology conflicts with {left_field}",
                 })
-    return result, evidence, review
+    return result, evidence, review, candidate_diagnostics
 
 
 def expected_visible_in_ocr(field: str, expected, lines: list[dict]) -> bool:
@@ -322,7 +356,7 @@ def main() -> None:
     started = time.perf_counter()
     for item in manifest["documents"]:
         lines, seconds = run_ocr(ocr, dataset / item["file"])
-        actual, evidence, review = extract(lines)
+        actual, evidence, review, candidate_diagnostics = extract(lines)
         comparison = {}
         for field, expected in item["expected"].items():
             matched = actual.get(field) == expected
@@ -344,7 +378,10 @@ def main() -> None:
         reports.append({
             "file": item["file"], "layout": item["layout"], "variant": item["variant"],
             "ocrSeconds": round(seconds, 3), "comparison": comparison,
-            "evidence": evidence, "reviewRequired": review, "ocrLines": lines,
+            "evidence": evidence,
+            "candidateDiagnostics": candidate_diagnostics,
+            "reviewRequired": review,
+            "ocrLines": lines,
         })
         print(f"{item['file']}: {sum(v['exactMatch'] for v in comparison.values())}/{len(comparison)}")
 
