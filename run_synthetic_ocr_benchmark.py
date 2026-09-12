@@ -31,19 +31,19 @@ FIELD_SCHEMA = {
         "aliases": [
             "document number", "identity number", "id number", "card number",
             "passport no", "license no", "no", "number", "رقم الهوية",
-            "رقم الإقامة", "رقم الوثيقة", "رقم البطاقة", "الرقم",
+            "رقم الإقامة", "رقم الوثيقة", "رقم البطاقة", "الرقم", "رقم",
         ]
     },
     "birthDate": {
-        "aliases": ["date of birth", "birth date", "dob", "تاريخ الميلاد", "تاريخ الولادة"]
+        "aliases": ["date of birth", "birth date", "dob", "birth", "الميلاد", "تاريخ الميلاد", "تاريخ الولادة"]
     },
     "issueDate": {
-        "aliases": ["issue date", "date of issue", "doi", "issued on", "تاريخ الاصدار", "تاريخ الإصدار"]
+        "aliases": ["issue date", "date of issue", "doi", "issued on", "issue", "تاريخ الاصدار", "تاريخ الإصدار"]
     },
     "expiryDate": {
         "aliases": [
             "expiry date", "expiration date", "date of expiry", "valid until",
-            "doe", "تاريخ الانتهاء", "تاريخ انتهاء الصلاحية",
+            "doe", "until", "الانتهاء", "تاريخ الانتهاء", "تاريخ انتهاء الصلاحية",
         ]
     },
 }
@@ -172,6 +172,28 @@ def extract_name(lines: list[dict], field: str) -> tuple[str | None, list[int]]:
             )
         if valid:
             candidates.append(line)
+    if is_arabic:
+        merged_candidates = []
+        for candidate in candidates:
+            nearby = [
+                line for line in lines
+                if line["id"] != candidate["id"]
+                and abs(line["center"][1] - candidate["center"][1]) <= 35
+                and abs(line["center"][0] - candidate["center"][0]) <= 220
+                and len(line["text"].split()) == 1
+                and ARABIC_RE.search(line["text"])
+                and not has_alias(line, ALL_FIELD_ALIASES)
+            ]
+            if nearby:
+                neighbor = max(nearby, key=lambda line: line["center"][0])
+                if neighbor["center"][0] > candidate["center"][0]:
+                    merged_candidates.append({
+                        **candidate,
+                        "text": f"{neighbor['text']} {candidate['text']}",
+                        "normalized": normalize(f"{neighbor['text']} {candidate['text']}"),
+                        "confidence": min(candidate["confidence"], neighbor["confidence"]),
+                    })
+        candidates.extend(merged_candidates)
     ranked = [
         (distance(label, candidate), -candidate["confidence"], label, candidate)
         for label in labels for candidate in candidates
@@ -191,9 +213,12 @@ def extract(lines: list[dict]) -> tuple[dict, dict, list[dict], dict]:
     review = []
     candidate_diagnostics = {}
     all_text = " ".join(line["normalized"] for line in lines)
+    title_tokens = set(" ".join(line["normalized"] for line in lines[:5]).split())
     result["documentType"] = next(
         (kind for kind, aliases in DOCUMENT_TYPES.items() if any(normalize(alias) in all_text for alias in aliases)),
-        "other",
+        "residence_permit"
+        if "مقيم" in title_tokens and bool({"بطاقة", "يطاقة"} & title_tokens)
+        else "other",
     )
 
     for field, spec in FIELD_SCHEMA.items():
