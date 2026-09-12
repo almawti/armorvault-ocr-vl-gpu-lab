@@ -6,9 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+except ImportError:
+    arabic_reshaper = None
+    get_display = None
 
 
 WIDTH, HEIGHT = 1200, 760
@@ -76,7 +84,8 @@ def draw_rtl(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, font, fi
     try:
         draw.text(xy, text, font=font, fill=fill, anchor="ra", direction="rtl", language="ar")
     except (KeyError, TypeError, ValueError):
-        draw.text(xy, text, font=font, fill=fill, anchor="ra")
+        rendered = get_display(arabic_reshaper.reshape(text)) if arabic_reshaper and get_display else text
+        draw.text(xy, rendered, font=font, fill=fill, anchor="ra")
 
 
 def render(case: dict, layout: str, font_path: str) -> Image.Image:
@@ -127,7 +136,10 @@ def degrade(image: Image.Image, variant: str) -> Image.Image:
 def expected(case: dict) -> dict:
     values = {"documentType": case["type"], "issueDate": None}
     for _, value, field in case["fields"]:
-        values[field] = value
+        if field in {"birthDate", "issueDate", "expiryDate"}:
+            values[field] = datetime.strptime(value, "%d/%m/%Y").strftime("%Y-%m-%d")
+        else:
+            values[field] = value
     return values
 
 
