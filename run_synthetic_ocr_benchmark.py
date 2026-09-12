@@ -192,6 +192,11 @@ def extract_name(lines: list[dict], field: str) -> tuple[str | None, list[int]]:
                         "text": f"{neighbor['text']} {candidate['text']}",
                         "normalized": normalize(f"{neighbor['text']} {candidate['text']}"),
                         "confidence": min(candidate["confidence"], neighbor["confidence"]),
+                        "center": [
+                            (candidate["center"][0] + neighbor["center"][0]) / 2,
+                            (candidate["center"][1] + neighbor["center"][1]) / 2,
+                        ],
+                        "sourceIds": [neighbor["id"], candidate["id"]],
                     })
         candidates.extend(merged_candidates)
     ranked = [
@@ -200,7 +205,8 @@ def extract_name(lines: list[dict], field: str) -> tuple[str | None, list[int]]:
     ]
     if ranked:
         _, _, label, candidate = min(ranked, key=lambda item: item[:2])
-        return candidate["text"], [label["id"], candidate["id"]]
+        source_ids = candidate.get("sourceIds", [candidate["id"]])
+        return candidate["text"], [label["id"], *source_ids]
     if candidates:
         candidate = max(candidates, key=lambda line: line["confidence"])
         return candidate["text"], [candidate["id"]]
@@ -320,6 +326,15 @@ def expected_visible_in_ocr(field: str, expected, lines: list[dict]) -> bool:
         return any(parse_date(line["text"]) == expected for line in lines)
     if field == "documentNumber":
         return any(identifier(line["text"]) == expected for line in lines)
+    if field == "holderNameArabic":
+        expected_words = normalize(str(expected)).split()
+        available_words = {
+            word
+            for line in lines
+            if ARABIC_RE.search(line["text"])
+            for word in normalize(line["text"]).split()
+        }
+        return len(expected_words) >= 2 and all(word in available_words for word in expected_words)
     expected_compact = normalize(str(expected)).replace(" ", "")
     return any(expected_compact in line["normalized"].replace(" ", "") for line in lines)
 
