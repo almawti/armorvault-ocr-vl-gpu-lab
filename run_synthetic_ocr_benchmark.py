@@ -116,6 +116,9 @@ def has_alias(line: dict, aliases: list[str]) -> bool:
 def strip_leading_alias(text: str, aliases: list[str]) -> str | None:
     """Return an inline value after a label, including joined Arabic labels."""
     cleaned = text.strip(" :：-|")
+    normalized_cleaned = normalize(cleaned)
+    if any(normalized_cleaned == normalize(alias) for alias in aliases):
+        return None
     for alias in sorted(aliases, key=len, reverse=True):
         pattern = re.compile(rf"^\s*{re.escape(alias)}\s*[:：|\-]?\s*", re.I)
         value = pattern.sub("", cleaned, count=1).strip(" :：-|")
