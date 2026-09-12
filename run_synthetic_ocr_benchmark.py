@@ -55,6 +55,16 @@ DOCUMENT_TYPES = {
     "driving_license": ["driving license", "رخصة قيادة"],
 }
 
+NAME_ALIASES = {
+    "holderNameArabic": ["اسم حامل الوثيقة", "الاسم الكامل", "الاسم"],
+    "holderNameEnglish": ["full name", "name in english", "holder name", "name"],
+}
+ALL_FIELD_ALIASES = [
+    alias
+    for spec in list(FIELD_SCHEMA.values()) + [{"aliases": aliases} for aliases in NAME_ALIASES.values()]
+    for alias in spec["aliases"]
+]
+
 
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text.translate(ARABIC_DIGITS)).lower()
@@ -95,7 +105,33 @@ def distance(left: dict, right: dict) -> float:
 
 
 def has_alias(line: dict, aliases: list[str]) -> bool:
-    return any(normalize(alias) in line["normalized"] for alias in aliases)
+    normalized = line["normalized"]
+    compact = normalized.replace(" ", "")
+    return any(
+        normalize(alias) in normalized or normalize(alias).replace(" ", "") in compact
+        for alias in aliases
+    )
+
+
+def strip_leading_alias(text: str, aliases: list[str]) -> str | None:
+    """Return an inline value after a label, including joined Arabic labels."""
+    cleaned = text.strip(" :：-|")
+    for alias in sorted(aliases, key=len, reverse=True):
+        pattern = re.compile(rf"^\s*{re.escape(alias)}\s*[:：|\-]?\s*", re.I)
+        value = pattern.sub("", cleaned, count=1).strip(" :：-|")
+        if value != cleaned and value:
+            return value
+    normalized_compact = normalize(cleaned).replace(" ", "")
+    for alias in sorted(aliases, key=len, reverse=True):
+        compact_alias = normalize(alias).replace(" ", "")
+        if normalized_compact.startswith(compact_alias) and len(normalized_compact) > len(compact_alias):
+            target = normalize(alias).split()[-1]
+            match = re.search(re.escape(target), normalize(cleaned))
+            if match:
+                normalized_value = normalize(cleaned)[match.end():].strip()
+                if normalized_value:
+                    return normalized_value
+    return None
 
 
 def identifier(text: str) -> str | None:
@@ -104,9 +140,52 @@ def identifier(text: str) -> str | None:
     return max(candidates, key=len, default=None)
 
 
-def extract(lines: list[dict]) -> tuple[dict, dict]:
+def extract_name(lines: list[dict], field: str) -> tuple[str | None, list[int]]:
+    aliases = NAME_ALIASES[field]
+    labels = [line for line in lines if has_alias(line, aliases)]
+    is_arabic = field == "holderNameArabic"
+
+    for label in labels:
+        value = strip_leading_alias(label["text"], aliases)
+        if not value:
+            continue
+        if is_arabic and len(ARABIC_RE.findall(value)) >= 3:
+            return value, [label["id"]]
+        if not is_arabic and re.fullmatch(r"[A-Z][A-Z, .-]{5,}", value.upper()):
+            return value.upper(), [label["id"]]
+
+    candidates = []
+    for line in lines:
+        if has_alias(line, ALL_FIELD_ALIASES):
+            continue
+        words = line["text"].replace(",", " ").split()
+        if is_arabic:
+            valid = len(words) >= 3 and sum(bool(ARABIC_RE.search(word)) for word in words) >= 3
+        else:
+            valid = (
+                len(words) >= 3
+                and re.fullmatch(r"[A-Z][A-Z, .-]{5,}", line["text"].upper()) is not None
+                and not ARABIC_RE.search(line["text"])
+            )
+        if valid:
+            candidates.append(line)
+    ranked = [
+        (distance(label, candidate), -candidate["confidence"], label, candidate)
+        for label in labels for candidate in candidates
+    ]
+    if ranked:
+        _, _, label, candidate = min(ranked, key=lambda item: item[:2])
+        return candidate["text"], [label["id"], candidate["id"]]
+    if candidates:
+        candidate = max(candidates, key=lambda line: line["confidence"])
+        return candidate["text"], [candidate["id"]]
+    return None, []
+
+
+def extract(lines: list[dict]) -> tuple[dict, dict, list[dict]]:
     result = {"issueDate": None}
     evidence = {}
+    review = []
     all_text = " ".join(line["normalized"] for line in lines)
     result["documentType"] = next(
         (kind for kind, aliases in DOCUMENT_TYPES.items() if any(normalize(alias) in all_text for alias in aliases)),
@@ -129,41 +208,55 @@ def extract(lines: list[dict]) -> tuple[dict, dict]:
             _, _, label, value_line, value = min(ranked, key=lambda item: item[:2])
             result[field] = value
             evidence[field] = [label["id"]] if label["id"] == value_line["id"] else [label["id"], value_line["id"]]
+            if field != "documentNumber" and value_line["confidence"] < 0.90:
+                review.append({
+                    "field": field,
+                    "value": value,
+                    "reason": "low OCR confidence",
+                    "confidence": value_line["confidence"],
+                    "sourceLineId": value_line["id"],
+                })
         elif field not in result:
             result[field] = None
 
-    latin_names = [
-        line for line in lines
-        if re.fullmatch(r"[A-Z][A-Z, .-]{8,}", line["text"])
-        and len(line["text"].replace(",", " ").split()) >= 3
-        and not has_alias(line, ["full name", "name"])
+    for field in ("holderNameEnglish", "holderNameArabic"):
+        value, source_ids = extract_name(lines, field)
+        result[field] = value
+        if source_ids:
+            evidence[field] = source_ids
+    if result.get("expiryDate"):
+        expiry = datetime.fromisoformat(result["expiryDate"]).date()
+        if expiry < datetime.now().date():
+            review.append({
+                "field": "expiryDate",
+                "value": result["expiryDate"],
+                "reason": "expiry date is in the past",
+            })
+    date_values = [
+        (field, result.get(field))
+        for field in ("birthDate", "issueDate", "expiryDate")
+        if result.get(field)
     ]
-    latin = max(latin_names, key=lambda line: line["confidence"], default=None)
-    result["holderNameEnglish"] = latin["text"] if latin else None
+    for index, (left_field, left_value) in enumerate(date_values):
+        for right_field, right_value in date_values[index + 1:]:
+            if left_value >= right_value:
+                review.append({
+                    "field": right_field,
+                    "value": right_value,
+                    "reason": f"date chronology conflicts with {left_field}",
+                })
+    return result, evidence, review
 
-    excluded = [normalize(value) for value in (
-        "الهوية الوطنية", "المملكة العربية السعودية", "وزارة الداخلية",
-        "اسم حامل الوثيقة", "الاسم الكامل", "تاريخ الميلاد",
-        "تاريخ الانتهاء", "مكان الميلاد", "رقم الهوية", "بطاقة مقيم",
-    )]
-    arabic_names = []
-    for line in lines:
-        words = line["normalized"].split()
-        if len(words) < 3 or sum(bool(ARABIC_RE.search(word)) for word in words) < 3:
-            continue
-        if any(value in line["normalized"] for value in excluded):
-            continue
-        score = line["confidence"]
-        if normalize("بنت") in words:
-            score += 3
-        elif normalize("بن") in words:
-            score += 2
-        if latin:
-            score += max(0, 1.5 - abs(line["center"][1] - latin["center"][1]) / 80)
-        arabic_names.append((score, line))
-    arabic = max(arabic_names, key=lambda item: item[0], default=(0, None))[1]
-    result["holderNameArabic"] = arabic["text"] if arabic else None
-    return result, evidence
+
+def expected_visible_in_ocr(field: str, expected, lines: list[dict]) -> bool:
+    if expected is None:
+        return True
+    if field in {"birthDate", "issueDate", "expiryDate"}:
+        return any(parse_date(line["text"]) == expected for line in lines)
+    if field == "documentNumber":
+        return any(identifier(line["text"]) == expected for line in lines)
+    expected_compact = normalize(str(expected)).replace(" ", "")
+    return any(expected_compact in line["normalized"].replace(" ", "") for line in lines)
 
 
 def make_ocr(workdir: Path) -> RapidOCR:
@@ -221,27 +314,46 @@ def main() -> None:
     ocr = make_ocr(dataset)
     reports = []
     exact = total = 0
+    field_stats = {}
+    failure_breakdown = {"ocr": 0, "mapping": 0}
     started = time.perf_counter()
     for item in manifest["documents"]:
         lines, seconds = run_ocr(ocr, dataset / item["file"])
-        actual, evidence = extract(lines)
+        actual, evidence, review = extract(lines)
         comparison = {}
         for field, expected in item["expected"].items():
             matched = actual.get(field) == expected
             exact += int(matched)
             total += 1
-            comparison[field] = {"actual": actual.get(field), "expected": expected, "exactMatch": matched}
+            stats = field_stats.setdefault(field, {"correct": 0, "total": 0})
+            stats["correct"] += int(matched)
+            stats["total"] += 1
+            failure_type = None
+            if not matched:
+                failure_type = "mapping" if expected_visible_in_ocr(field, expected, lines) else "ocr"
+                failure_breakdown[failure_type] += 1
+            comparison[field] = {
+                "actual": actual.get(field),
+                "expected": expected,
+                "exactMatch": matched,
+                "failureType": failure_type,
+            }
         reports.append({
             "file": item["file"], "layout": item["layout"], "variant": item["variant"],
             "ocrSeconds": round(seconds, 3), "comparison": comparison,
-            "evidence": evidence, "ocrLines": lines,
+            "evidence": evidence, "reviewRequired": review, "ocrLines": lines,
         })
         print(f"{item['file']}: {sum(v['exactMatch'] for v in comparison.values())}/{len(comparison)}")
 
+    for stats in field_stats.values():
+        stats["accuracy"] = round(stats["correct"] / stats["total"], 4) if stats["total"] else 0
     result = {
         "models": {"ocr": "PP-OCRv5 Mobile detector + Arabic recognizer ONNX", "semanticMatcher": None},
         "documents": len(reports), "exactFields": exact, "totalFields": total,
         "fieldAccuracy": round(exact / total, 4) if total else 0,
+        "accuracyByField": field_stats,
+        "failureBreakdown": failure_breakdown,
+        "reviewRequiredCount": sum(len(report["reviewRequired"]) for report in reports),
         "totalSeconds": round(time.perf_counter() - started, 3), "reports": reports,
     }
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
